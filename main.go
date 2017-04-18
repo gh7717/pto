@@ -1,8 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/nlopes/slack"
+	"golang.org/x/net/context"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
+	"google.golang.org/api/calendar/v3"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -10,12 +16,8 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"time"
-
-	"golang.org/x/net/context"
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
-	"google.golang.org/api/calendar/v3"
 )
 
 // getClient uses a Context and Config to retrieve a Token
@@ -116,30 +118,87 @@ func main() {
 	events, err := srv.Events.List("mirantis.com_iqrn5epep3dunclian026s4c6g@group.calendar.google.com").ShowDeleted(false).
 		SingleEvents(true).TimeMin(t).TimeMax(n).OrderBy("startTime").Do()
 	if err != nil {
-		log.Fatalf("Unable to retrive events information for next 6 months. %v", err)
+		log.Fatalf("Unable to retrive events information for next 2 months. %v", err)
 	}
-
+	CHANNEL_ID := os.Getenv("CHANNEL")
+	//TOKEN := os.Getenv("TOKEN")
+	//api := slack.New(TOKEN)
+	//g, err := api.GetGroupInfo(CHANNEL_ID)
+	//if err != nil {
+	//	log.Printf("ERROR: get group info: %s", err)
+	//}
+	//var users map[string]string
+	//users = make(map[string]string)
+	//for _, i := range g.Members {
+	//	u, err := api.GetUserInfo(i)
+	//	if err != nil {
+	//		log.Printf("ERROR: error during getting user info: %s", err)
+	//	}
+	// possible bug if RealName is the same for 2 or more people
+	//	users[u.RealName] = u.ID
+	//}
+	fields := make([]slack.AttachmentField, 0)
 	fmt.Println("Upcoming events:")
 	if len(events.Items) > 0 {
 		for _, i := range events.Items {
-			var when, end string
-			// If the DateTime is an empty string the Event is an all-day Event.
-			// So only Date is available.
-			if i.Start.DateTime != "" {
-				when = i.Start.DateTime
-			} else {
-				when = i.Start.Date
-			}
 
-			if i.End.DateTime != "" {
-				end = i.End.DateTime
-			} else {
-				end = i.End.Date
+			var when, end string
+			if strings.Contains(i.Summary, "PTO") || strings.Contains(i.Summary, "pto") || strings.Contains(i.Summary, "vacation") {
+				// If the DateTime is an empty string the Event is an all-day Event.
+				// So only Date is available.
+
+				if i.Start.DateTime != "" {
+					when = i.Start.DateTime[0:10]
+				} else {
+					when = i.Start.Date
+				}
+
+				if i.End.DateTime != "" {
+					end = i.End.DateTime[0:10]
+				} else {
+					end = i.End.Date
+				}
+
+				fields = append(fields, slack.AttachmentField{
+					Title: i.Summary,
+					Value: fmt.Sprintf("%s - %s", when, end),
+				})
+
 			}
-			fmt.Printf("%s (%s) - (%s)\n", i.Summary, when, end)
 		}
 	} else {
 		fmt.Printf("No upcoming events found.\n")
 	}
+	// open Spreadsheet for L2 calendar and add this to the slack message
+	attachment := slack.Attachment{
+		Pretext: "",
+		Text:    fmt.Sprintf("PTO calendar for current 2 months"),
+		Fields:  fields,
+	}
+	params := slack.PostMessageParameters{}
+	params.Attachments = []slack.Attachment{attachment}
+	var message slack.Msg
+	message.Channel = CHANNEL_ID
+	message.Text = "<!here>"
+	message.PinnedTo = append(message.PinnedTo, CHANNEL_ID)
+	message.Attachments = params.Attachments
 
+	body, _ := json.Marshal(message)
+	log.Printf("DEBUG: message: %s", body)
+	req, err := http.NewRequest("POST", "https://hooks.slack.com/services/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", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	slack_client := &http.Client{}
+	resp, err := slack_client.Do(req)
+	if err != nil {
+		log.Printf("ERROR: send request to web hook %v", err)
+	}
+	defer resp.Body.Close()
+	/*
+		_, _, err = api.PostMessage(CHANNEL_ID, "<!here>", params)
+		if err != nil {
+			fmt.Printf("%s\n", err)
+			return
+		}
+	*/
 }
