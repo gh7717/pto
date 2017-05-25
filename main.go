@@ -1,74 +1,34 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
-	"github.com/nlopes/slack"
-	"golang.org/x/net/context"
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
-	"google.golang.org/api/calendar/v3"
 	"io/ioutil"
 	"log"
 	"net/http"
-	"net/url"
+	"net/http/pprof"
 	"os"
-	"os/user"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/context"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
+
+	"github.com/gorilla/mux"
+	"github.com/nlopes/slack"
+
+	"google.golang.org/api/calendar/v3"
+	"google.golang.org/api/sheets/v4"
 )
 
-// getClient uses a Context and Config to retrieve a Token
-// then generate a Client. It returns the generated Client.
 func getClient(ctx context.Context, config *oauth2.Config) *http.Client {
-	cacheFile, err := tokenCacheFile()
-	if err != nil {
-		log.Fatalf("Unable to get path to cached credential file. %v", err)
-	}
-	tok, err := tokenFromFile(cacheFile)
-	if err != nil {
-		tok = getTokenFromWeb(config)
-		saveToken(cacheFile, tok)
-	}
+	tok, _ := tokenFromFile(*credential)
 	return config.Client(ctx, tok)
 }
 
-// getTokenFromWeb uses Config to request a Token.
-// It returns the retrieved Token.
-func getTokenFromWeb(config *oauth2.Config) *oauth2.Token {
-	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
-	fmt.Printf("Go to the following link in your browser then type the "+
-		"authorization code: \n%v\n", authURL)
-
-	var code string
-	if _, err := fmt.Scan(&code); err != nil {
-		log.Fatalf("Unable to read authorization code %v", err)
-	}
-
-	tok, err := config.Exchange(oauth2.NoContext, code)
-	if err != nil {
-		log.Fatalf("Unable to retrieve token from web %v", err)
-	}
-	return tok
-}
-
-// tokenCacheFile generates credential file path/filename.
-// It returns the generated credential path/filename.
-func tokenCacheFile() (string, error) {
-	usr, err := user.Current()
-	if err != nil {
-		return "", err
-	}
-	tokenCacheDir := filepath.Join(usr.HomeDir, ".credentials")
-	os.MkdirAll(tokenCacheDir, 0700)
-	return filepath.Join(tokenCacheDir,
-		url.QueryEscape("calendar-go-quickstart.json")), err
-}
-
-// tokenFromFile retrieves a Token from a given file path.
-// It returns the retrieved Token and any read error encountered.
 func tokenFromFile(file string) (*oauth2.Token, error) {
 	f, err := os.Open(file)
 	if err != nil {
@@ -80,72 +40,64 @@ func tokenFromFile(file string) (*oauth2.Token, error) {
 	return t, err
 }
 
-// saveToken uses a file path to create a file and store the
-// token in it.
-func saveToken(file string, token *oauth2.Token) {
-	fmt.Printf("Saving credential file to: %s\n", file)
-	f, err := os.Create(file)
-	if err != nil {
-		log.Fatalf("Unable to cache oauth token: %v", err)
-	}
-	defer f.Close()
-	json.NewEncoder(f).Encode(token)
+func init() {
+	spreadsheetId = flag.String("spreadsheetid", "15WRnM6FkhPaye8sDnZifWf_VpavDBzR4oAYKvLqwn0A", "spreadsheet id for US L1 Team")
+	calendarid = flag.String("calendarid", "mirantis.com_iqrn5epep3dunclian026s4c6g@group.calendar.google.com", "Mirantis Operation calendar id")
+	token = flag.String("token", "client_secret.json", "client secret token")
+	credential = flag.String("crednetial", "calendar-go-quickstart.json", "cache token file")
+	verificationToken = flag.String("verification_token", "", "Slack Verification Token")
 }
 
-func main() {
-	ctx := context.Background()
+var (
+	spreadsheetId                        *string
+	calendarid                           *string
+	token, credential, verificationToken *string
+)
 
-	b, err := ioutil.ReadFile("client_secret.json")
-	if err != nil {
-		log.Fatalf("Unable to read client secret file: %v", err)
-	}
+type Vacation struct {
+	Start time.Time
+	End   time.Time
+}
+type Attachment struct {
+	Text string `json:"text"`
+}
+type Message struct {
+	ResponseType string `json:"response_type,omitempty"`
+	slack.Msg
+}
+type spreadsheets struct {
+	s *sheets.Service
+}
+type ptoCalendar struct {
+	s *calendar.Service
+}
 
-	// If modifying these scopes, delete your previously saved credentials
-	// at ~/.credentials/calendar-go-quickstart.json
-	config, err := google.ConfigFromJSON(b, calendar.CalendarReadonlyScope)
+func NewSpreadsheet(client *http.Client) (s spreadsheets, err error) {
+	spreadsheet, err := sheets.New(client)
 	if err != nil {
-		log.Fatalf("Unable to parse client secret file to config: %v", err)
+		return s, err
 	}
-	client := getClient(ctx, config)
-
-	srv, err := calendar.New(client)
+	s.s = spreadsheet
+	return s, nil
+}
+func NewCalendar(client *http.Client) (s ptoCalendar, err error) {
+	calendar, err := calendar.New(client)
 	if err != nil {
-		log.Fatalf("Unable to retrieve calendar Client %v", err)
+		return s, err
 	}
-
-	t := time.Now().Format(time.RFC3339)
-	n := time.Now().AddDate(0, 2, 0).Format(time.RFC3339)
-	events, err := srv.Events.List("mirantis.com_iqrn5epep3dunclian026s4c6g@group.calendar.google.com").ShowDeleted(false).
-		SingleEvents(true).TimeMin(t).TimeMax(n).OrderBy("startTime").Do()
+	s.s = calendar
+	return s, nil
+}
+func (s ptoCalendar) getPtoCalendar(calendarid, begin, end string, filter []string) (fields []slack.AttachmentField, err error) {
+	events, err := s.s.Events.List(calendarid).ShowDeleted(false).MaxResults(2500).
+		SingleEvents(true).TimeMin(begin).TimeMax(end).OrderBy("startTime").Do()
 	if err != nil {
-		log.Fatalf("Unable to retrive events information for next 2 months. %v", err)
+		return fields, err
 	}
-	CHANNEL_ID := os.Getenv("CHANNEL")
-	//TOKEN := os.Getenv("TOKEN")
-	//api := slack.New(TOKEN)
-	//g, err := api.GetGroupInfo(CHANNEL_ID)
-	//if err != nil {
-	//	log.Printf("ERROR: get group info: %s", err)
-	//}
-	//var users map[string]string
-	//users = make(map[string]string)
-	//for _, i := range g.Members {
-	//	u, err := api.GetUserInfo(i)
-	//	if err != nil {
-	//		log.Printf("ERROR: error during getting user info: %s", err)
-	//	}
-	// possible bug if RealName is the same for 2 or more people
-	//	users[u.RealName] = u.ID
-	//}
-	fields := make([]slack.AttachmentField, 0)
-	fmt.Println("Upcoming events:")
 	if len(events.Items) > 0 {
 		for _, i := range events.Items {
-
 			var when, end string
-			if strings.Contains(i.Summary, "PTO") || strings.Contains(i.Summary, "pto") || strings.Contains(i.Summary, "vacation") {
-				// If the DateTime is an empty string the Event is an all-day Event.
-				// So only Date is available.
+			if strings.Contains(i.Summary, "PTO") || strings.Contains(i.Summary, "vacation") {
 
 				if i.Start.DateTime != "" {
 					when = i.Start.DateTime[0:10]
@@ -167,38 +119,182 @@ func main() {
 			}
 		}
 	} else {
-		fmt.Printf("No upcoming events found.\n")
+		fields = append(fields, slack.AttachmentField{
+			Title: "",
+			Value: fmt.Sprintf("No incomming events"),
+		})
 	}
-	// open Spreadsheet for L2 calendar and add this to the slack message
+	return fields, err
+}
+func parseRequest(r *http.Request) (s map[string][]string, err error) {
+	err = r.ParseForm()
+	if err != nil {
+		return s, err
+	}
+	return map[string][]string(r.Form), nil
+}
+
+func Pto(w http.ResponseWriter, r *http.Request) {
+	commandArguments, err := parseRequest(r)
+	if err != nil {
+		log.Printf("ERROR: request, can't be parsed - %v", err)
+	}
+	filters := commandArguments["text"]
+
+	var f []string
+	for _, filter := range filters {
+		f = strings.Split(filter, " ")
+		log.Printf("%v\n", f)
+	}
+
+	ctx := context.Background()
+	b, err := ioutil.ReadFile(*token)
+	if err != nil {
+		log.Fatalf("Unable to read client secret file %s: %v", *token, err)
+	}
+	config, err := google.ConfigFromJSON(b, calendar.CalendarReadonlyScope, sheets.SpreadsheetsReadonlyScope)
+	if err != nil {
+		log.Fatalf("Unable to parse client secret file to config: %v", err)
+	}
+	client := getClient(ctx, config)
+	srv, err := NewCalendar(client)
+	if err != nil {
+		log.Fatalf("Unable to retrieve calendar Client %v", err)
+	}
+	t := time.Now()
+	begin := t.Format(time.RFC3339)
+	end := t.AddDate(0, 2, 0).Format(time.RFC3339)
+	fields, err := srv.getPtoCalendar(*calendarid, begin, end, f)
 	attachment := slack.Attachment{
-		Pretext: "",
-		Text:    fmt.Sprintf("PTO calendar for current 2 months"),
-		Fields:  fields,
+		Color:  "#b01408",
+		Title:  fmt.Sprintf("PTO schedule:"),
+		Fields: fields,
 	}
+
 	params := slack.PostMessageParameters{}
 	params.Attachments = []slack.Attachment{attachment}
-	var message slack.Msg
-	message.Channel = CHANNEL_ID
-	message.Text = "<!here>"
-	message.PinnedTo = append(message.PinnedTo, CHANNEL_ID)
+	var message Message
+	message.ResponseType = "in_channel"
 	message.Attachments = params.Attachments
-
 	body, _ := json.Marshal(message)
-	log.Printf("DEBUG: message: %s", body)
-	req, err := http.NewRequest("POST", "https://hooks.slack.com/services/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", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(body))
+	w.WriteHeader(200)
+}
+func getMonth(pto Vacation) int64 {
+	return int64(pto.Start.Month()) + 8
+}
+func UpdatePto(w http.ResponseWriter, r *http.Request) {
+	users := make(map[string][]Vacation)
 
-	slack_client := &http.Client{}
-	resp, err := slack_client.Do(req)
+	commandArguments, err := parseRequest(r)
 	if err != nil {
-		log.Printf("ERROR: send request to web hook %v", err)
+		log.Printf("ERROR: request, can't be parsed - %v", err)
 	}
-	defer resp.Body.Close()
-	/*
-		_, _, err = api.PostMessage(CHANNEL_ID, "<!here>", params)
-		if err != nil {
-			fmt.Printf("%s\n", err)
-			return
+	filters := commandArguments["text"]
+
+	var f []string
+	for _, filter := range filters {
+		f = strings.Split(filter, " ")
+	}
+
+	ctx := context.Background()
+	b, err := ioutil.ReadFile(*token)
+	config, err := google.ConfigFromJSON(b, calendar.CalendarReadonlyScope, sheets.SpreadsheetsScope)
+	if err != nil {
+		w.WriteHeader(503)
+		log.Fatalf("Unable to parse client secret file to config: %v", err)
+	}
+	client := getClient(ctx, config)
+	srv, err := NewCalendar(client)
+	if err != nil {
+		w.WriteHeader(503)
+		log.Fatalf("Unable to retrieve calendar Client %v", err)
+	}
+	t := strconv.Itoa(time.Now().Year())
+	begin := fmt.Sprintf("%s-01-01T00:00:00Z", t)
+	end := fmt.Sprintf("%s-12-31T23:59:59Z", t)
+	fields, err := srv.getPtoCalendar(*calendarid, begin, end, f)
+	if err != nil {
+		w.WriteHeader(503)
+		log.Printf("event queury error: %s", err)
+	}
+	var v Vacation
+	for _, pto := range fields {
+		who := strings.TrimSpace(strings.Split(pto.Title, "-")[0])
+		dates := strings.Split(pto.Value, " - ")
+		v.Start, _ = time.Parse("2006-01-02", dates[0])
+		endPto, _ := time.Parse("2006-01-02", dates[1])
+		v.End = endPto.AddDate(0, 0, -1)
+		users[who] = append(users[who], v)
+	}
+	spr, err := NewSpreadsheet(client)
+	if err != nil {
+		log.Printf("unable to open a spreadsheet %s", err)
+	}
+	readRange := "Sheet1"
+	resp, err := spr.s.Spreadsheets.Values.Get(*spreadsheetId, readRange).Do()
+	if err != nil {
+		w.WriteHeader(401)
+		log.Printf("Unable to retrieve data from sheet. %v", err)
+	}
+
+	if len(resp.Values) > 0 {
+		for i, row := range resp.Values {
+			// user name
+			userName := row[0].(string)
+			updateRequest := `
+{"requests": [
+    {"updateCells": {
+        "fields": "*",
+        "start": {
+          "rowIndex": 2,
+          "columnIndex": 11,
+          "sheetId": 0
+        },
+        "rows": [{
+            "values": [
+              { "userEnteredValue": {
+                "stringValue": "02/03-04/03"
+               }}]}]}}]}
+`
+			var rb sheets.BatchUpdateSpreadsheetRequest
+			err = json.Unmarshal([]byte(updateRequest), &rb)
+			if err != nil {
+				log.Printf("%s", err)
+			}
+
+			ptoSpreadsheet := make(map[int64]string, 12)
+			for _, data := range users[userName] {
+				m := getMonth(data)
+				ptoSpreadsheet[m] = fmt.Sprintf("%s%s-%s\n", ptoSpreadsheet[m], data.Start.Format("01/02"), data.End.Format("01/02"))
+			}
+			// think how to send all data using one request
+			for month, ptoRange := range ptoSpreadsheet {
+				rb.Requests[0].UpdateCells.Start.RowIndex = int64(i)
+				rb.Requests[0].UpdateCells.Start.ColumnIndex = month
+				rb.Requests[0].UpdateCells.Rows[0].Values[0].UserEnteredValue.StringValue = ptoRange
+				_, err = spr.s.Spreadsheets.BatchUpdate(*spreadsheetId, &rb).Context(ctx).Do()
+				if err != nil {
+					log.Printf("error during update: %v", err)
+				}
+			}
 		}
-	*/
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+}
+
+func main() {
+	flag.Parse()
+	router := mux.NewRouter().StrictSlash(true)
+	router.HandleFunc("/pto", Pto)
+	router.HandleFunc("/update", UpdatePto)
+	// profile router
+	router.HandleFunc("/debug/pprof/", pprof.Index)
+	router.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	router.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	router.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	router.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	http.ListenAndServe(":8082", router)
 }
